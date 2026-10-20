@@ -1,0 +1,396 @@
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateProductDto } from './dto';
+import { CategoryId, ProductStatus } from '@prisma/client';
+import { StorageService } from '../storage/storage.service';
+import { GarmentCategory, MlGarmentClient } from './ml-garment.client';
+
+const ALLOWED_MIME = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+]);
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+
+@Injectable()
+export class SellerService {
+  private readonly logger = new Logger(SellerService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storage: StorageService,
+    private readonly mlGarment: MlGarmentClient,
+  ) {}
+
+  /**
+   * After a product is created we walk every variant, ask ml-garment to build a
+   * template from its first image, and persist the mask + landmarks. Fail-open:
+   * a broken template must never block the seller from creating the product.
+   */
+  private async buildGarmentTemplatesForProduct(
+    productId: string,
+    category: GarmentCategory,
+  ) {
+    if (!this.mlGarment.isEnabled()) return;
+
+    const variants = await this.prisma.productVariant.findMany({
+      where: { productId, garmentTemplate: null },
+    });
+
+    for (const variant of variants) {
+      const imageUrl = variant.images[0];
+      if (!imageUrl) continue;
+
+      try {
+        const buffer = await this.fetchImage(imageUrl);
+        const template = await this.mlGarment.extract(
+          { buffer, mimetype: 'image/jpeg', originalname: 'variant.jpg' },
+          category,
+        );
+
+        // Persist the two PNGs so the compositor can read them straight from the CDN.
+        const canonical = await this.storage.save(
+          `garment/${variant.id}`,
+          Buffer.from(template.canonical_png_base64, 'base64'),
+          'image/png',
+          'canonical.png',
+        );
+        const mask = await this.storage.save(
+          `garment/${variant.id}`,
+          Buffer.from(template.mask_png_base64, 'base64'),
+          'image/png',
+          'mask.png',
+        );
+
+        await this.prisma.garmentTemplate.create({
+          data: {
+            variantId: variant.id,
+            canonicalImageKey: canonical.key,
+            alphaMaskKey: mask.key,
+            landmarks: template.landmarks as object,
+            standardPose: template.standard_pose as object,
+            colorPalette: template.color_palette as unknown as object,
+          },
+        });
+        this.logger.log(`built garment template for variant ${variant.id}`);
+      } catch (err) {
+        this.logger.warn(
+          `garment template failed for variant ${variant.id}: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  private async fetchImage(url: string): Promise<Buffer> {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+
+  async uploadImages(userId: string, files: Express.Multer.File[]) {
+    const seller = await this.requireSeller(userId);
+    if (!files || files.length === 0) throw new BadRequestException('NO_FILES');
+
+    const results = await Promise.all(
+      files.map(async (f) => {
+        if (!ALLOWED_MIME.has(f.mimetype)) {
+          throw new BadRequestException(`UNSUPPORTED_MIME:${f.mimetype}`);
+        }
+        if (f.size > MAX_IMAGE_BYTES) {
+          throw new BadRequestException(`TOO_LARGE:${f.originalname}`);
+        }
+        const saved = await this.storage.save(
+          `seller/${seller.id}`,
+          f.buffer,
+          f.mimetype,
+          f.originalname,
+        );
+        return { name: f.originalname, ...saved };
+      }),
+    );
+
+    return { files: results };
+  }
+
+  private async requireSeller(userId: string) {
+    const seller = await this.prisma.seller.findUnique({ where: { userId } });
+    if (!seller) throw new ForbiddenException('SELLER_PROFILE_MISSING');
+    return seller;
+  }
+
+  async getAnalytics(userId: string) {
+    const seller = await this.requireSeller(userId);
+
+    const [products, variantAgg, tryOnCount, orderStats] = await Promise.all([
+      this.prisma.product.count({ where: { sellerId: seller.id } }),
+      this.prisma.productVariant.aggregate({
+        where: { product: { sellerId: seller.id } },
+        _sum: { stock: true },
+        _count: true,
+      }),
+      this.prisma.tryOnSession.count({
+        where: { variant: { product: { sellerId: seller.id } } },
+      }),
+      this.prisma.orderItem.aggregate({
+        where: { variant: { product: { sellerId: seller.id } } },
+        _sum: { quantity: true, priceSnapshot: true },
+        _count: true,
+      }),
+    ]);
+
+    // 7-day daily try-on trend so the dashboard can draw a mini-chart.
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+    const dailyRows = await this.prisma.$queryRaw<Array<{ day: Date; count: bigint }>>`
+      SELECT date_trunc('day', ts.created_at) AS day, COUNT(*)::bigint AS count
+      FROM tryon_sessions ts
+      JOIN product_variants pv ON pv.id = ts.variant_id
+      JOIN products p ON p.id = pv.product_id
+      WHERE p.seller_id = ${seller.id}::uuid AND ts.created_at >= ${sevenDaysAgo}
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `;
+
+    // Fill missing days so the chart is always 7 buckets long.
+    const trend: Array<{ day: string; count: number }> = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 24 * 3600 * 1000);
+      const key = d.toISOString().slice(0, 10);
+      const row = dailyRows.find((r) => r.day.toISOString().slice(0, 10) === key);
+      trend.push({ day: key, count: row ? Number(row.count) : 0 });
+    }
+
+    // Top 5 most-tried variants (helps the seller understand what's trending).
+    const topRows = await this.prisma.$queryRaw<
+      Array<{ variant_id: string; title: string; color: string; count: bigint }>
+    >`
+      SELECT ts.variant_id::text, p.title_ru AS title, pv.color, COUNT(*)::bigint AS count
+      FROM tryon_sessions ts
+      JOIN product_variants pv ON pv.id = ts.variant_id
+      JOIN products p ON p.id = pv.product_id
+      WHERE p.seller_id = ${seller.id}::uuid
+      GROUP BY ts.variant_id, p.title_ru, pv.color
+      ORDER BY count DESC
+      LIMIT 5
+    `;
+
+    return {
+      totals: {
+        products,
+        variants: variantAgg._count,
+        stock: variantAgg._sum.stock ?? 0,
+        tryOnSessions: tryOnCount,
+        orderItems: orderStats._count,
+        orderUnits: Number(orderStats._sum.quantity ?? 0),
+        grossUsd: Number(orderStats._sum.priceSnapshot ?? 0),
+      },
+      tryOnTrend7d: trend,
+      topVariants: topRows.map((r) => ({
+        variantId: r.variant_id,
+        title: r.title,
+        color: r.color,
+        count: Number(r.count),
+      })),
+    };
+  }
+
+  // Compact dashboard stats. activeOrders counts orders that still need the
+  // seller's attention (confirmed/preparing/shipping); delivered/cancelled are
+  // excluded so the counter represents real work-in-flight.
+  async getStats(userId: string) {
+    const seller = await this.requireSeller(userId);
+    const [productCount, orderAgg, activeOrdersCount, tryOnCount] = await Promise.all([
+      this.prisma.product.count({ where: { sellerId: seller.id } }),
+      this.prisma.orderItem.aggregate({
+        where: { variant: { product: { sellerId: seller.id } } },
+        _sum: { quantity: true, priceSnapshot: true },
+      }),
+      this.prisma.order.count({
+        where: {
+          orderStatus: { in: ['pending', 'confirmed', 'processing', 'shipped', 'proba_scheduled'] as any },
+          items: { some: { variant: { product: { sellerId: seller.id } } } },
+        },
+      }),
+      this.prisma.tryOnSession.count({
+        where: { variant: { product: { sellerId: seller.id } } },
+      }),
+    ]);
+    return {
+      totalProducts: productCount,
+      activeOrders: activeOrdersCount,
+      revenue: Number(orderAgg._sum.priceSnapshot ?? 0),
+      tryOnCount,
+    };
+  }
+
+  // Orders list filtered by the seller: an order is "the seller's" if any of
+  // its line items references one of their variants. Items from other sellers
+  // are excluded from the response so each seller only sees their own line.
+  async listOrders(userId: string) {
+    const seller = await this.requireSeller(userId);
+    const orders = await this.prisma.order.findMany({
+      where: {
+        items: { some: { variant: { product: { sellerId: seller.id } } } },
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        items: {
+          where: { variant: { product: { sellerId: seller.id } } },
+          include: {
+            variant: { include: { product: { select: { titleRu: true, coverUrl: true } } } },
+          },
+        },
+        user: { select: { fullName: true, username: true, phone: true } },
+      },
+      take: 100,
+    });
+
+    return orders.map((o) => ({
+      id: o.id,
+      code: o.id.slice(0, 8).toUpperCase(),
+      customerName: o.user.fullName || `@${o.user.username}`,
+      time: o.createdAt.toISOString(),
+      status: this.mapOrderStatus(o.orderStatus),
+      total: o.items.reduce((sum, it) => sum + Number(it.priceSnapshot) * it.quantity, 0),
+      tracking: null as string | null,
+      items: o.items.map((it) => ({
+        name: it.titleSnapshot ?? it.variant.product.titleRu,
+        color: it.colorSnapshot ?? it.variant.color,
+        size: it.sizeSnapshot ?? it.variant.size,
+        qty: it.quantity,
+        imageUrl: it.imageSnapshot ?? it.variant.product.coverUrl,
+      })),
+    }));
+  }
+
+  // Collapses the backend's richer order lifecycle into the four buckets the
+  // mobile seller tab shows: new, preparing, shipping, delivered. Unmatched
+  // values fall back to 'new' so a lifecycle change never breaks the UI.
+  private mapOrderStatus(status: string): 'new' | 'preparing' | 'shipping' | 'delivered' {
+    switch (status) {
+      case 'confirmed':
+      case 'processing':
+        return 'preparing';
+      case 'shipped':
+      case 'proba_scheduled':
+        return 'shipping';
+      case 'delivered':
+        return 'delivered';
+      default:
+        return 'new';
+    }
+  }
+
+  async listProducts(userId: string) {
+    const seller = await this.requireSeller(userId);
+    const rows = await this.prisma.product.findMany({
+      where: { sellerId: seller.id },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        _count: { select: { variants: true } },
+        variants: { select: { stock: true } },
+      },
+    });
+
+    return rows.map((p) => ({
+      id: p.id,
+      titleRu: p.titleRu,
+      titleUz: p.titleUz,
+      categoryId: p.categoryId,
+      basePriceUsd: Number(p.basePriceUsd),
+      coverUrl: p.coverUrl,
+      status: p.status,
+      createdAt: p.createdAt.toISOString(),
+      publishedAt: p.publishedAt?.toISOString() ?? null,
+      popularityScore: p.popularityScore,
+      variantCount: p._count.variants,
+      totalStock: p.variants.reduce((sum, v) => sum + v.stock, 0),
+    }));
+  }
+
+  async createProduct(userId: string, dto: CreateProductDto) {
+    const seller = await this.requireSeller(userId);
+
+    // Guard against duplicate SKUs across all products.
+    const skus = dto.variants.map((v) => v.sku);
+    if (new Set(skus).size !== skus.length) {
+      throw new BadRequestException('DUPLICATE_SKU_IN_REQUEST');
+    }
+    const existingSku = await this.prisma.productVariant.findFirst({
+      where: { sku: { in: skus } },
+      select: { sku: true },
+    });
+    if (existingSku) throw new ConflictException(`SKU_ALREADY_EXISTS:${existingSku.sku}`);
+
+    const created = await this.prisma.product.create({
+      data: {
+        sellerId: seller.id,
+        categoryId: dto.categoryId as CategoryId,
+        titleRu: dto.titleRu,
+        titleUz: dto.titleUz ?? null,
+        descriptionRu: dto.descriptionRu ?? null,
+        basePriceUsd: dto.basePriceUsd,
+        coverUrl: dto.coverUrl,
+        gallery: [],
+        attributes: (dto.attributes ?? {}) as object,
+        filters: this.buildFiltersFromVariants(dto.variants),
+        status: ProductStatus.draft,
+        popularityScore: 0,
+        variants: {
+          create: dto.variants.map((v) => ({
+            color: v.color,
+            colorHex: v.colorHex,
+            size: v.size,
+            priceUsd: v.priceUsd ?? dto.basePriceUsd,
+            stock: v.stock,
+            sku: v.sku,
+            images: v.images ?? [],
+          })),
+        },
+      },
+    });
+
+    // Run garment-template extraction in the background — don't block the response.
+    void this.buildGarmentTemplatesForProduct(created.id, dto.categoryId).catch((e) =>
+      this.logger.error(`garment templates failed: ${e.message}`),
+    );
+
+    return { id: created.id };
+  }
+
+  async submit(userId: string, productId: string) {
+    const seller = await this.requireSeller(userId);
+    const product = await this.prisma.product.findUnique({ where: { id: productId } });
+    if (!product) throw new NotFoundException('PRODUCT_NOT_FOUND');
+    if (product.sellerId !== seller.id) throw new ForbiddenException('NOT_YOUR_PRODUCT');
+    if (product.status !== ProductStatus.draft && product.status !== ProductStatus.rejected) {
+      throw new BadRequestException('ONLY_DRAFT_CAN_BE_SUBMITTED');
+    }
+
+    // MVP: auto-publish (moderator flow comes later).
+    const updated = await this.prisma.product.update({
+      where: { id: productId },
+      data: {
+        status: ProductStatus.published,
+        publishedAt: new Date(),
+      },
+    });
+
+    return { id: updated.id, status: updated.status };
+  }
+
+  private buildFiltersFromVariants(variants: CreateProductDto['variants']) {
+    const colors = Array.from(new Set(variants.map((v) => v.color)));
+    const sizes = Array.from(new Set(variants.map((v) => v.size)));
+    return { color: colors, size: sizes };
+  }
+}

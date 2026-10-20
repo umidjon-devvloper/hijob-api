@@ -1,0 +1,593 @@
+// N24:31 database schema
+// Docs: ../../docs/ARCHITECTURE.md §06
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────
+
+enum UserRole {
+  buyer
+  seller
+  admin
+  moderator
+}
+
+enum Language {
+  uz
+  ru
+  en
+}
+
+enum ClothingSize {
+  XS
+  S
+  M
+  L
+  XL
+  XXL
+}
+
+enum FaceTemplateStatus {
+  processing
+  ready
+  failed
+}
+
+enum ProductStatus {
+  draft
+  pending
+  published
+  archived
+  rejected
+}
+
+enum CategoryId {
+  scarves
+  dresses
+  bags
+  accessories
+}
+
+enum DeliveryType {
+  delivery
+  pickup
+  proba
+}
+
+enum DeliverySpeed {
+  today
+  tomorrow
+  scheduled
+}
+
+enum PaymentMethod {
+  click
+  payme
+  visa
+  mastercard
+  humo
+  uzcard
+}
+
+enum PaymentStatus {
+  pending
+  paid
+  failed
+  refunded
+}
+
+enum OrderStatus {
+  pending
+  confirmed
+  processing
+  shipped
+  delivered
+  proba_scheduled
+  returned
+  cancelled
+}
+
+// ─── Core: Users ─────────────────────────────────────────────
+
+model User {
+  id            String   @id @default(uuid()) @db.Uuid
+  username      String   @unique @db.VarChar(32)
+  phone         String   @unique @db.VarChar(20)
+  fullName      String?  @map("full_name") @db.VarChar(120)
+  role          UserRole @default(buyer)
+  passwordHash  String   @map("password_hash")
+  language      Language @default(ru)
+  emailVerified Boolean  @default(false) @map("email_verified")
+  phoneVerified Boolean  @default(false) @map("phone_verified")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  onboardingFaceDone Boolean @default(false) @map("onboarding_face_done")
+  onboardingBodyDone Boolean @default(false) @map("onboarding_body_done")
+
+  // Storage key of the raw selfie captured once at onboarding. Reused by
+  // the background worker to pre-render a face-swapped mannequin for every
+  // product variant so the Primerka tab never hits the swap endpoint on
+  // product open. Null until the buyer finishes the face step.
+  selfieKey          String? @map("selfie_key")
+  // Snapshot of the body picker so a background render covering a newly
+  // published variant knows which bodyType × height band mannequin to
+  // pick without re-reading the mobile store.
+  tryonBodyType      String? @map("tryon_body_type") @db.VarChar(10)
+  tryonHeightCm      Int?    @map("tryon_height_cm") @db.SmallInt
+
+  // Admin / moderation: flipped by admins to lock accounts. The auth guard
+  // and anything role-sensitive respects this; login refuses when false.
+  isActive   Boolean   @default(true) @map("is_active")
+  lastSeenAt DateTime? @map("last_seen_at")
+
+  bodyParams    BodyParams?
+  faceTemplate  FaceTemplate?
+  seller        Seller?
+  wishlist      WishlistItem[]
+  cartItems     CartItem[]
+  orders        Order[]
+  tryOnSessions TryOnSession[]
+  faceRenders   UserFaceRender[]
+  faceRenderJobs UserFaceRenderJob[]
+  addresses     Address[]
+  refreshTokens RefreshToken[]
+  pushTokens    PushToken[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+enum NotificationKind {
+  order_update
+  style_job_done
+  promo
+  system
+}
+
+// Admin-uploaded base mannequin templates — one per size bucket. The dev
+// AI pipeline picks the one matching the buyer's bodyParams.height and
+// hands it to GPT alongside the hijob so the drape lands on a mannequin
+// of the right proportions.
+model MannequinTemplate {
+  id         String   @id @default(uuid()) @db.Uuid
+  sizeKey    String   @unique @map("size_key") @db.VarChar(16) // child-s / child-m / xs / s / m / l / xl / xxl
+  label      String   @db.VarChar(80)
+  minHeightCm Int     @map("min_height_cm")
+  maxHeightCm Int     @map("max_height_cm")
+  imageUrl   String   @map("image_url")
+  active     Boolean  @default(true)
+  sortOrder  Int      @default(0) @map("sort_order")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([active, minHeightCm])
+  @@map("mannequin_templates")
+}
+
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  kind      NotificationKind
+  title     String           @db.VarChar(160)
+  body      String
+  data      Json?
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model PushToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  token     String   @unique
+  platform  String   @db.VarChar(16)  // 'ios' | 'android' | 'web'
+  createdAt DateTime @default(now()) @map("created_at")
+  lastUsedAt DateTime @default(now()) @map("last_used_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_tokens")
+}
+
+model OtpCode {
+  id        String   @id @default(uuid()) @db.Uuid
+  phone     String   @db.VarChar(20)
+  codeHash  String   @map("code_hash")
+  attempts  Int      @default(0)
+  expiresAt DateTime @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([phone, createdAt])
+  @@map("otp_codes")
+}
+
+model BodyParams {
+  userId        String       @id @map("user_id") @db.Uuid
+  heightCm      Int          @map("height_cm") @db.SmallInt
+  weightKg      Int          @map("weight_kg") @db.SmallInt
+  age           Int          @db.SmallInt
+  preferredSize ClothingSize @map("preferred_size")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_body_params")
+}
+
+model FaceTemplate {
+  userId                String             @id @map("user_id") @db.Uuid
+  version               String             @default("1.0") @db.VarChar(10)
+  status                FaceTemplateStatus @default(processing)
+  landmarks             Json?
+  skinTone              Json?              @map("skin_tone")
+  proportions           Json?
+  s3HeadMaskKey         String?            @map("s3_head_mask_key")
+  s3NeckMaskKey         String?            @map("s3_neck_mask_key")
+  s3TexturesPrefix      String?            @map("s3_textures_prefix")
+  s3EncryptedPhotosPrefix String?          @map("s3_encrypted_photos_prefix")
+  createdAt             DateTime           @default(now()) @map("created_at")
+  lastUsedAt            DateTime           @default(now()) @map("last_used_at")
+  expiresAt             DateTime           @map("expires_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("face_templates")
+}
+
+// ─── Sellers ─────────────────────────────────────────────────
+
+model Seller {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @unique @map("user_id") @db.Uuid
+  brandName     String   @map("brand_name") @db.VarChar(120)
+  logoUrl       String?  @map("logo_url")
+  description   String?
+  rating        Decimal  @default(0) @db.Decimal(3, 2)
+  reviewsCount  Int      @default(0) @map("reviews_count")
+  city          String?
+  addressLine   String?  @map("address_line")
+  latitude      Decimal? @db.Decimal(9, 6)
+  longitude     Decimal? @db.Decimal(9, 6)
+  verified      Boolean  @default(false)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  products  Product[]
+  styleJobs ProductStyleJob[]
+
+  @@map("sellers")
+}
+
+// ─── Catalog ─────────────────────────────────────────────────
+
+model Category {
+  id       CategoryId @id
+  nameUz   String     @map("name_uz") @db.VarChar(80)
+  nameRu   String     @map("name_ru") @db.VarChar(80)
+  nameEn   String     @map("name_en") @db.VarChar(80)
+  iconUrl  String?    @map("icon_url")
+  coverUrl String?    @map("cover_url")
+  order    Int        @default(0)
+
+  products Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id             String        @id @default(uuid()) @db.Uuid
+  sellerId       String        @map("seller_id") @db.Uuid
+  categoryId     CategoryId    @map("category_id")
+  titleRu        String        @map("title_ru") @db.VarChar(200)
+  titleUz        String?       @map("title_uz") @db.VarChar(200)
+  titleEn        String?       @map("title_en") @db.VarChar(200)
+  descriptionRu  String?       @map("description_ru")
+  descriptionUz  String?       @map("description_uz")
+  basePriceUsd   Decimal       @map("base_price_usd") @db.Decimal(10, 2)
+  attributes     Json          @default("{}")
+  filters        Json          @default("{}")
+  coverUrl       String        @map("cover_url")
+  gallery        String[]      @default([])
+  // Mannequin pre-dressed with this hijab — rendered by seller once at
+  // publish time (or seeded). Buyer-side try-on just face-swaps their selfie
+  // into this image, so the heavy composition only runs once per product.
+  styledImageUrl String?       @map("styled_image_url")
+  status         ProductStatus @default(draft)
+  popularityScore Float        @default(0) @map("popularity_score")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  publishedAt    DateTime?     @map("published_at")
+
+  seller       Seller            @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  category     Category          @relation(fields: [categoryId], references: [id])
+  variants     ProductVariant[]
+  wishlistedBy WishlistItem[]
+  styleJobs    ProductStyleJob[]
+
+  @@index([categoryId, status, publishedAt(sort: Desc)])
+  @@index([sellerId, status])
+  @@map("products")
+}
+
+enum StyleJobStatus {
+  pending
+  running
+  done
+  failed
+}
+
+/// Asynchronous "dress the mannequin" job. A seller submits a plain
+/// mannequin photo + a hijab image; a worker loop picks it up, calls
+/// ml-compositor to compose the hijab onto the mannequin, uploads the
+/// result and writes it back onto Product.styledImageUrl. Buyer-side
+/// try-on then face-swaps straight into that pre-composed shot.
+model ProductStyleJob {
+  id            String         @id @default(uuid()) @db.Uuid
+  productId     String         @map("product_id") @db.Uuid
+  sellerId      String         @map("seller_id") @db.Uuid
+  status        StyleJobStatus @default(pending)
+  // Inputs — URLs the seller provided (R2 or /uploads/… keys).
+  mannequinUrl  String         @map("mannequin_url")
+  hijabUrl      String         @map("hijab_url")
+  // Garment template parameters (which style, which colour hex).
+  tyingStyle    String         @default("classical") @map("tying_style") @db.VarChar(20)
+  colorHex      String         @default("#8A8D5B") @map("color_hex") @db.VarChar(9)
+  // Which size silhouette this render targets (S / M / L / XL). Null for
+  // one-size items (classic hijab 110x110). The mannequin pool uses this to
+  // pick a size-matched reference image before composition.
+  targetSize    String?        @map("target_size") @db.VarChar(10)
+  // Output — populated when status flips to "done". Mirrors into
+  // Product.styledImageUrl on success.
+  resultUrl     String?        @map("result_url")
+  // 9-variant grid results, keyed by sizeKey (slim-short … full-tall).
+  // Null for legacy single-shot jobs. When present, the buyer side picks
+  // the matching variant based on their body type + height band.
+  resultVariants Json?         @map("result_variants")
+  errorMessage  String?        @map("error_message")
+  attempts      Int            @default(0)
+  createdAt     DateTime       @default(now()) @map("created_at")
+  startedAt     DateTime?      @map("started_at")
+  finishedAt    DateTime?      @map("finished_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  seller  Seller  @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([productId])
+  @@map("product_style_jobs")
+}
+
+model ProductVariant {
+  id         String  @id @default(uuid()) @db.Uuid
+  productId  String  @map("product_id") @db.Uuid
+  color      String  @db.VarChar(32)
+  colorHex   String  @map("color_hex") @db.VarChar(9)
+  size       String  @db.VarChar(10)
+  priceUsd   Decimal? @map("price_usd") @db.Decimal(10, 2)
+  stock      Int      @default(0)
+  sku        String   @unique @db.VarChar(64)
+  images     String[] @default([])
+
+  product         Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  garmentTemplate GarmentTemplate?
+  cartItems       CartItem[]
+  orderItems      OrderItem[]
+  tryOnSessions   TryOnSession[]
+  faceRenders     UserFaceRender[]
+  faceRenderJobs  UserFaceRenderJob[]
+
+  @@unique([productId, color, size])
+  @@index([productId])
+  @@map("product_variants")
+}
+
+model GarmentTemplate {
+  variantId          String   @id @map("variant_id") @db.Uuid
+  canonicalImageKey  String   @map("canonical_image_key")
+  alphaMaskKey       String   @map("alpha_mask_key")
+  sideImageKey       String?  @map("side_image_key")
+  backImageKey       String?  @map("back_image_key")
+  landmarks          Json
+  standardPose       Json     @map("standard_pose")
+  colorPalette       Json?    @map("color_palette")
+  tyingStyles        Json?    @map("tying_styles")
+  approvedByUserId   String?  @map("approved_by_user_id") @db.Uuid
+  approvedAt         DateTime? @map("approved_at")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@map("garment_templates")
+}
+
+// ─── Try-On ──────────────────────────────────────────────────
+
+enum UserFaceRenderStatus {
+  pending
+  running
+  done
+  failed
+}
+
+/// Pre-rendered face-swapped mannequin photo for a single (user, variant)
+/// pair. Produced once by the background worker after onboarding, then
+/// served instantly from the catalog / Primerka tab without re-running
+/// facefusion on every product open.
+model UserFaceRender {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  variantId String   @map("variant_id") @db.Uuid
+  url       String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, variantId])
+  @@index([userId])
+  @@map("user_face_renders")
+}
+
+/// One-shot "swap my face onto this variant's mannequin" job. The worker
+/// drains these in FIFO order and writes a UserFaceRender row on success.
+model UserFaceRenderJob {
+  id           String               @id @default(uuid()) @db.Uuid
+  userId       String               @map("user_id") @db.Uuid
+  variantId    String               @map("variant_id") @db.Uuid
+  status       UserFaceRenderStatus @default(pending)
+  attempts     Int                  @default(0)
+  errorMessage String?              @map("error_message")
+  createdAt    DateTime             @default(now()) @map("created_at")
+  startedAt    DateTime?            @map("started_at")
+  finishedAt   DateTime?            @map("finished_at")
+
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, variantId])
+  @@index([status, createdAt])
+  @@map("user_face_render_jobs")
+}
+
+model TryOnSession {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  variantId   String   @map("variant_id") @db.Uuid
+  tyingStyle  String?  @map("tying_style") @db.VarChar(32)
+  resultUrl   String?  @map("result_url")
+  latencyMs   Int?     @map("latency_ms")
+  addedToCart Boolean  @default(false) @map("added_to_cart")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("tryon_sessions")
+}
+
+// ─── Wishlist / Cart ─────────────────────────────────────────
+
+model WishlistItem {
+  userId    String   @map("user_id") @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  addedAt   DateTime @default(now()) @map("added_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([userId, productId])
+  @@map("wishlist_items")
+}
+
+model CartItem {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  variantId String   @map("variant_id") @db.Uuid
+  quantity  Int      @default(1)
+  addedAt   DateTime @default(now()) @map("added_at")
+
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, variantId])
+  @@index([userId])
+  @@map("cart_items")
+}
+
+// ─── Addresses & Orders ──────────────────────────────────────
+
+model Address {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  label        String?  @db.VarChar(60)
+  city         String   @db.VarChar(80)
+  district     String   @db.VarChar(80)
+  street       String   @db.VarChar(160)
+  building     String   @db.VarChar(40)
+  apartment    String?  @db.VarChar(40)
+  landmark     String?
+  latitude     Decimal? @db.Decimal(9, 6)
+  longitude    Decimal? @db.Decimal(9, 6)
+  isDefault    Boolean  @default(false) @map("is_default")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders Order[]
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+model Order {
+  id             String        @id @default(uuid()) @db.Uuid
+  userId         String        @map("user_id") @db.Uuid
+  addressId      String?       @map("address_id") @db.Uuid
+  deliveryType   DeliveryType  @map("delivery_type")
+  deliverySpeed  DeliverySpeed? @map("delivery_speed")
+  scheduledAt    DateTime?     @map("scheduled_at")
+  addressSnapshot Json?        @map("address_snapshot")
+  comment        String?
+  subtotalUsd    Decimal       @map("subtotal_usd") @db.Decimal(10, 2)
+  deliveryFeeUsd Decimal       @map("delivery_fee_usd") @db.Decimal(10, 2)
+  totalUsd       Decimal       @map("total_usd") @db.Decimal(10, 2)
+  paymentMethod  PaymentMethod @map("payment_method")
+  paymentStatus  PaymentStatus @default(pending) @map("payment_status")
+  paymentTxId    String?       @map("payment_tx_id")
+  orderStatus    OrderStatus   @default(pending) @map("order_status")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  address Address?    @relation(fields: [addressId], references: [id])
+  items   OrderItem[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("orders")
+}
+
+model OrderItem {
+  orderId        String  @map("order_id") @db.Uuid
+  variantId      String  @map("variant_id") @db.Uuid
+  quantity       Int
+  priceSnapshot  Decimal @map("price_snapshot_usd") @db.Decimal(10, 2)
+  titleSnapshot  String  @map("title_snapshot") @db.VarChar(200)
+  imageSnapshot  String  @map("image_snapshot")
+  colorSnapshot  String  @map("color_snapshot") @db.VarChar(32)
+  sizeSnapshot   String  @map("size_snapshot") @db.VarChar(10)
+
+  order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@id([orderId, variantId])
+  @@map("order_items")
+}
